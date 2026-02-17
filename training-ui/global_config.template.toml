@@ -13,4 +13,4 @@ dim_level = 0
 brightness_level = 100
 blur_level = 0
 text_shadow_size = 0
-theme = "default"
+theme = "github-dark"

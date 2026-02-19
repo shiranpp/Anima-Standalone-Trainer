@@ -1,6 +1,6 @@
 # Anima Standalone Trainer
 
-A lightweight, decoupled training environment for circlestone-labs' Anima model, currently support Lora training only. Built upon [sd-scripts](https://github.com/kohya-ss/sd-scripts) implementation.
+A lightweight, decoupled training environment for circlestone-labs' Anima model, currently support Lora training only. Windows only, Linux compatibility is in work. Built upon [sd-scripts](https://github.com/kohya-ss/sd-scripts) implementation.
 
 <img width="2554" height="1234" alt="image" src="https://github.com/user-attachments/assets/cb5ff930-ce8c-49d6-a77a-3da393fe719d" />
 

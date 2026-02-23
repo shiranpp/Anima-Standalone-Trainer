@@ -33,6 +33,10 @@ Run the provided setup script for your operating system:
 This script will probably install a pytorch with CPU only.
 Depends on your system, you may want to install a specific version of Pytorch with CUDA.
 
+```cmd
+pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
+```
+
 ## Launching the UI
 
 To start the training server and open the web interface:

@@ -779,7 +779,7 @@ class BaseDataset(torch.utils.data.Dataset):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
                 #Only log on main process to prevent duplicate logs from multi-worker data loaders
-                if PartialState().is_main_process:
+                if int(os.environ.get("RANK", "0")) == 0:
                     logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 
                 num_epochs = epoch - self.current_epoch
@@ -787,7 +787,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.current_epoch += 1
                     self.shuffle_buckets()
             else:
-                if PartialState().is_main_process:
+                if int(os.environ.get("RANK", "0")) == 0:
                     logger.warning("epoch is not incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 self.current_epoch = epoch
 
@@ -5440,7 +5440,7 @@ def prepare_accelerator(args: argparse.Namespace):
             os.environ["USE_LIBUV"] = "0"
             rank = int(os.environ.get("RANK", "0"))
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-            dist.init_process_group("gloo", rank=rank, world_size=world_size)
+            dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
 
     if args.logging_dir is None:

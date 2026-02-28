@@ -54,7 +54,7 @@ Once launched, open your browser to: `http://localhost:3000`
 
 ## Multi-GPUs
 
-Tested on torch2.7+cu128 with [this fix](https://github.com/pytorch/pytorch/pull/175316) applied on Windows when encountered **libuv** error.
+Tested on torch2.7+cu128 and torch2.10+cu130 with [this fix](https://github.com/pytorch/pytorch/pull/175316) applied on Windows when encountered **libuv** error.
 
 Seems to works best with torch<=2.3 and cuda <= 12.4 without directly applying the fix.
 

@@ -931,7 +931,7 @@ class NetworkTrainer:
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
             # manually save to avoid _orig_mod. key prefix issues with torch.compile
-            network_type = type(accelerator.unwrap_model(network))
+            network_type = type(accelerator.unwrap_model(network, keep_torch_compile=False))
             for i in reversed(range(len(models))):
                 base_model = accelerator.unwrap_model(models[i], keep_torch_compile=False)
                 if isinstance(base_model, network_type) and (accelerator.is_main_process or args.deepspeed):
@@ -954,7 +954,7 @@ class NetworkTrainer:
 
         def load_model_hook(models, input_dir):
             # Manually load network weights and pop all models to prevent accelerate's default load.
-            network_type = type(accelerator.unwrap_model(network))
+            network_type = type(accelerator.unwrap_model(network, keep_torch_compile=False))
             for i in reversed(range(len(models))):
                 base_model = accelerator.unwrap_model(models[i], keep_torch_compile=False)
                 if isinstance(base_model, network_type):

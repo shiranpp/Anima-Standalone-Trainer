@@ -508,14 +508,36 @@ def train(args):
 
     # Hooks for saving/loading training state (epoch, step)
     def save_model_hook(models, weights, output_dir):
+        from accelerate.utils.other import clean_state_dict_for_safetensors
+        from safetensors.torch import save_file
+
         if accelerator.is_main_process:
             train_state_file = os.path.join(output_dir, "train_state.json")
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {global_step}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": global_step}, f)
 
+        # Manually save models to prevent issues with torch.compile and accelerate's native safetensors saving
+        for i in reversed(range(len(models))):
+            model = models[i]
+            if accelerator.is_main_process:
+                model_name = "model" if i == 0 else f"model_{i}"
+                safetensors_path = os.path.join(output_dir, f"{model_name}.safetensors")
+                base_model = accelerator.unwrap_model(model, keep_torch_compile=False)
+                state_dict = base_model.state_dict()
+
+                state_dict = clean_state_dict_for_safetensors(state_dict)
+                save_file(state_dict, safetensors_path, metadata={"format": "pt"})
+                logger.info(f"Saved {model_name}.safetensors to {output_dir}")
+            
+            # Pop to prevent accelerate from natively saving this model
+            models.pop(i)
+            weights.pop(i)
+
     steps_from_state = None
     def load_model_hook(models, input_dir):
+        from safetensors.torch import load_file
+        
         nonlocal steps_from_state
         train_state_file = os.path.join(input_dir, "train_state.json")
         if os.path.exists(train_state_file):
@@ -523,6 +545,20 @@ def train(args):
                 data = json.load(f)
             steps_from_state = data["current_step"]
             logger.info(f"load train state from {train_state_file}: {data}")
+
+        # Manually load models
+        for i in reversed(range(len(models))):
+            model = models[i]
+            model_name = "model" if i == 0 else f"model_{i}"
+            safetensors_path = os.path.join(input_dir, f"{model_name}.safetensors")
+            if os.path.exists(safetensors_path):
+                base_model = accelerator.unwrap_model(model, keep_torch_compile=False)
+                state_dict = load_file(safetensors_path, device="cpu")
+                base_model.load_state_dict(state_dict)
+                logger.info(f"Loaded {model_name}.safetensors from {input_dir}")
+            
+            # Pop to prevent accelerate from natively loading this model
+            models.pop(i)
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)

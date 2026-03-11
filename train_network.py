@@ -25,7 +25,7 @@ from accelerate.utils import set_seed
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
@@ -756,21 +756,11 @@ class NetworkTrainer:
             trainable_params = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
             lr_descriptions = None
 
-        # if len(trainable_params) == 0:
-        #     accelerator.print("no trainable parameters found / 学習可能なパラメータが見つかりませんでした")
-        # for params in trainable_params:
-        #     for k, v in params.items():
-        #         if type(v) == float:
-        #             pass
-        #         else:
-        #             v = len(v)
-        #         accelerator.print(f"trainable_params: {k} = {v}")
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
         optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
 
         # prepare dataloader
-        # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
         # some strategies can be None
         train_dataset_group.set_current_strategies()
         if val_dataset_group is not None:
@@ -928,20 +918,20 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
-        # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
-            # manually save to avoid _orig_mod. key prefix issues with torch.compile
+            # only save network weights (not unet/text_encoder) with own naming counter
             network_type = type(accelerator.unwrap_model(network, keep_torch_compile=False))
-            for i in reversed(range(len(models))):
+            save_idx = 0
+            for i in range(len(models)):
                 base_model = accelerator.unwrap_model(models[i], keep_torch_compile=False)
                 if isinstance(base_model, network_type) and (accelerator.is_main_process or args.deepspeed):
-                    model_name = "model" if i == 0 else f"model_{i}"
+                    model_name = "model" if save_idx == 0 else f"model_{save_idx}"
                     safetensors_path = os.path.join(output_dir, f"{model_name}.safetensors")
                     state_dict = clean_state_dict_for_safetensors(base_model.state_dict())
                     safetensors_save_file(state_dict, safetensors_path, metadata={"format": "pt"})
                     logger.info(f"Saved {model_name}.safetensors to {output_dir}")
-                models.pop(i)
-                weights.pop(i)
+                    save_idx += 1
+            weights.clear()
 
             # save current epoch and step
             train_state_file = os.path.join(output_dir, "train_state.json")
@@ -953,18 +943,20 @@ class NetworkTrainer:
         steps_from_state = None
 
         def load_model_hook(models, input_dir):
-            # Manually load network weights and pop all models to prevent accelerate's default load.
+            # only load network weights with own naming counter (models is a local copy, safe to pop)
             network_type = type(accelerator.unwrap_model(network, keep_torch_compile=False))
-            for i in reversed(range(len(models))):
+            load_idx = 0
+            for i in range(len(models)):
                 base_model = accelerator.unwrap_model(models[i], keep_torch_compile=False)
                 if isinstance(base_model, network_type):
-                    model_name = "model" if i == 0 else f"model_{i}"
+                    model_name = "model" if load_idx == 0 else f"model_{load_idx}"
                     safetensors_path = os.path.join(input_dir, f"{model_name}.safetensors")
                     if os.path.exists(safetensors_path):
                         state_dict = safetensors_load_file(safetensors_path, device="cpu")
                         base_model.load_state_dict(state_dict)
                         logger.info(f"Loaded {model_name}.safetensors from {input_dir}")
-                models.pop(i)
+                    load_idx += 1
+            models.clear()
 
             # load current epoch and step
             nonlocal steps_from_state
@@ -1002,7 +994,6 @@ class NetworkTrainer:
         accelerator.print(
             f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
         )
-        # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
@@ -1349,7 +1340,6 @@ class NetworkTrainer:
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
-            # global_step = initial_step # DO NOT OVERWRITE. global_step should be the total steps.
         elif initial_step > 0:
             # If not skipping data, we still need to calculate initial_step for the first epoch's inner loop skip
             initial_step = initial_step % math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1372,8 +1362,6 @@ class NetworkTrainer:
             disable=not accelerator.is_local_main_process,
             desc="steps",
         )
-        # if global_step > 0:
-        #     progress_bar.update(global_step)
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)

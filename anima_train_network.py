@@ -44,11 +44,6 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             )
             args.cache_text_encoder_outputs = True
 
-        # Anima uses embedding-level dropout (in AnimaTextEncodingStrategy) instead of
-        # dataset-level caption dropout, so zero out subset-level rates to allow caching.
-        # Anima uses embedding-level dropout (in AnimaTextEncodingStrategy) instead of
-        # dataset-level caption dropout, so we migrate any subset-level dropout rates
-        # to the global level and zero them out to allow text encoder output caching.
         global_dropout_rate = getattr(args, 'caption_dropout_rate', 0.0)
         max_subset_dropout = 0.0
         if hasattr(train_dataset_group, 'datasets'):
@@ -134,8 +129,6 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             dit.set_flash_attn(True)
 
         # Store unsloth preference so that when the base NetworkTrainer calls
-        # dit.enable_gradient_checkpointing(cpu_offload=...), we can override to use unsloth.
-        # The base trainer only passes cpu_offload, so we store the flag on the model.
         self._use_unsloth_offload_checkpointing = getattr(args, 'unsloth_offload_checkpointing', False)
 
         # Block swap
@@ -517,12 +510,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return dit
 
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
-        # Drop cached text encoder outputs for caption dropout
-        text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-        if text_encoder_outputs_list is not None:
-            text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
-            text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(*text_encoder_outputs_list)
-            batch["text_encoder_outputs_list"] = text_encoder_outputs_list
+        pass  
 
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         if self.is_swapping_blocks:

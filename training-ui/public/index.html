@@ -386,6 +386,7 @@
                             <label>Network Module</label>
                             <select id="cfg-network-module">
                                 <option value="networks.lora_anima">LoRA (Anima)</option>
+                                <option value="networks.lora_lumina">LoRA (Lumina)</option>
                                 <option value="networks.lora">LoRA (Standard)</option>
                             </select>
                         </div>
@@ -693,76 +694,68 @@
                 <button id="btn-close-global" class="btn-icon">✕</button>
             </div>
 
-            <h4>Model Paths</h4>
-            <div class="form-group">
-                <label>DiT Model Path</label>
-                <input type="text" id="cfg-global-dit"
-                    placeholder="C:\Anima\split_files\diffusion_models\anima-preview.safetensors">
-            </div>
-            <div class="form-group">
-                <label>Qwen3 Text Encoder Path</label>
-                <input type="text" id="cfg-global-qwen3"
-                    placeholder="C:\Anima\split_files\text_encoders\qwen_3_06b_base.safetensors">
-            </div>
-            <div class="form-group">
-                <label>VAE Path</label>
-                <input type="text" id="cfg-global-vae"
-                    placeholder="C:\Anima\split_files\vae\qwen_image_vae.safetensors">
+            <div class="tabs" id="global-tabs-nav" style="margin-bottom: 15px;">
+                <!-- Dynamically populated from architecture registry -->
             </div>
 
-            <h4>Environment</h4>
-            <div class="form-group">
-                <label>Python Venv Path</label>
-                <input type="text" id="cfg-global-venv" placeholder="C:\sd-scripts\venv">
-                <small>Path to the Python virtual environment with training dependencies.</small>
-            </div>
+            <div class="tab-content" id="global-tabs-content" style="border: 1px solid var(--border); padding: 15px; border-radius: 8px;">
+                <!-- Architecture path tabs injected dynamically -->
 
-            <h4>UI Customization</h4>
-            <div class="form-group">
-                <label>Theme</label>
-                <select id="cfg-theme">
-                    <option value="github-dark">GitHub Dark</option>
-                    <option value="github-light">GitHub Light</option>
-                    <option value="midnight-blue">Midnight Blue</option>
-                    <option value="cherry-pink">Cherry Pink</option>
-                </select>
-            </div>
-
-            <div class="form-group" style="margin-top: 12px;">
-                <label>Background Image</label>
-                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px;">
-                    <input type="file" id="cfg-bg-upload" accept="image/*" style="display: none;">
-                    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('cfg-bg-upload').click()">📁
-                        Choose Image</button>
-                    <button id="btn-remove-bg" class="btn btn-ghost btn-sm hidden"
-                        style="color: var(--danger);">Remove</button>
-                </div>
-                <div id="bg-pos-group" class="hidden">
-                    <label>Positioning (Drag to focal point)</label>
-                    <div id="bg-drag-container" class="bg-drag-container">
-                        <div id="bg-drag-preview" class="bg-drag-preview"></div>
-                        <div id="bg-drag-handle" class="bg-drag-handle"></div>
-                    </div>
-                </div>
-                <div id="bg-visual-controls" class="hidden" style="margin-top: 12px;">
+                <!-- Application Tab (static) -->
+                <div id="gtab-app" class="gtab-pane hidden">
                     <div class="form-group">
-                        <label>Dim Level (Overlay Opacity): <span id="val-bg-dim">70%</span></label>
-                        <input type="range" id="cfg-bg-dim" min="0" max="100" value="70">
+                        <label>Python Venv Path</label>
+                        <input type="text" id="cfg-global-venv" placeholder="C:\sd-scripts\venv">
+                        <small>Path to the Python virtual environment with training dependencies.</small>
                     </div>
-                    <div class="form-group" style="margin-top: 8px;">
-                        <label>Image Brightness: <span id="val-bg-brightness">100%</span></label>
-                        <input type="range" id="cfg-bg-brightness" min="50" max="150" value="100">
+
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label>Theme</label>
+                        <select id="cfg-theme">
+                            <option value="github-dark">GitHub Dark</option>
+                            <option value="github-light">GitHub Light</option>
+                            <option value="midnight-blue">Midnight Blue</option>
+                            <option value="cherry-pink">Cherry Pink</option>
+                        </select>
                     </div>
-                    <div class="form-group" style="margin-top: 8px;">
-                        <label>Backdrop Blur: <span id="val-bg-blur">10px</span></label>
-                        <input type="range" id="cfg-bg-blur" min="0" max="20" value="10">
-                    </div>
-                    <div class="form-group" style="margin-top: 8px;">
-                        <label>Text Shadow Intensity: <span id="val-text-shadow">0px</span></label>
-                        <input type="range" id="cfg-text-shadow" min="0" max="10" value="0">
+
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label>Background Image</label>
+                        <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px;">
+                            <input type="file" id="cfg-bg-upload" accept="image/*" style="display: none;">
+                            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('cfg-bg-upload').click()">📁
+                                Choose Image</button>
+                            <button id="btn-remove-bg" class="btn btn-ghost btn-sm hidden"
+                                style="color: var(--danger);">Remove</button>
+                        </div>
+                        <div id="bg-pos-group" class="hidden">
+                            <label>Positioning (Drag to focal point)</label>
+                            <div id="bg-drag-container" class="bg-drag-container">
+                                <div id="bg-drag-preview" class="bg-drag-preview"></div>
+                                <div id="bg-drag-handle" class="bg-drag-handle"></div>
+                            </div>
+                        </div>
+                        <div id="bg-visual-controls" class="hidden" style="margin-top: 12px;">
+                            <div class="form-group">
+                                <label>Dim Level (Overlay Opacity): <span id="val-bg-dim">70%</span></label>
+                                <input type="range" id="cfg-bg-dim" min="0" max="100" value="70">
+                            </div>
+                            <div class="form-group" style="margin-top: 8px;">
+                                <label>Image Brightness: <span id="val-bg-brightness">100%</span></label>
+                                <input type="range" id="cfg-bg-brightness" min="50" max="150" value="100">
+                            </div>
+                            <div class="form-group" style="margin-top: 8px;">
+                                <label>Backdrop Blur: <span id="val-bg-blur">10px</span></label>
+                                <input type="range" id="cfg-bg-blur" min="0" max="20" value="10">
+                            </div>
+                            <div class="form-group" style="margin-top: 8px;">
+                                <label>Text Shadow Intensity: <span id="val-text-shadow">0px</span></label>
+                                <input type="range" id="cfg-text-shadow" min="0" max="10" value="0">
+                            </div>
+                        </div>
+                        <small>Drag the focal point in the preview above. Auto-scales to fit.</small>
                     </div>
                 </div>
-                <small>Drag the focal point in the preview above. Auto-scales to fit.</small>
             </div>
 
             <div class="modal-actions">

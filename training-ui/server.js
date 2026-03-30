@@ -24,8 +24,39 @@ const ROOT_DIR = path.join(__dirname, '..');
 const JOBS_DIR = path.join(__dirname, 'jobs');
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
 const GLOBAL_CONFIG_PATH = path.join(__dirname, 'global_config.toml');
-const TRAINING_SCRIPT = path.join(ROOT_DIR, 'anima_train_network.py');
 const UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
+const ARCHITECTURES_PATH = path.join(__dirname, 'architectures.json');
+
+// Load architecture registry
+const ARCH_REGISTRY = JSON.parse(fs.readFileSync(ARCHITECTURES_PATH, 'utf8'));
+
+// Resolve architecture from a job config's network_module
+function getArchForJob(jobConfig) {
+    const netModule = jobConfig?.network_arguments?.network_module || '';
+    for (const [archId, arch] of Object.entries(ARCH_REGISTRY.architectures)) {
+        if (arch.network_modules.includes(netModule)) {
+            return { id: archId, ...arch };
+        }
+    }
+    // Check for architecture-specific training sections as fallback
+    for (const [archId, arch] of Object.entries(ARCH_REGISTRY.architectures)) {
+        if (arch.training_section && jobConfig[arch.training_section]) {
+            return { id: archId, ...arch };
+        }
+    }
+    // Default
+    const defaultId = ARCH_REGISTRY.default_architecture;
+    return { id: defaultId, ...ARCH_REGISTRY.architectures[defaultId] };
+}
+
+// Build model_arguments from registry + global config for a given architecture
+function buildModelArgs(arch, globalConfig) {
+    const modelArgs = {};
+    for (const [configKey, pathDef] of Object.entries(arch.global_paths)) {
+        modelArgs[pathDef.cli_flag] = globalConfig.model_paths?.[configKey] || '';
+    }
+    return modelArgs;
+}
 
 // Middleware
 app.use(express.json({ limit: '50mb' }));
@@ -87,13 +118,23 @@ function getGlobalConfig() {
     }
     return {
         model_paths: {
+            // Anima
             dit_path: '',
             qwen3_path: '',
-            vae_path: ''
+            vae_path: '',
+            // Lumina
+            lumina_dit_path: '',
+            gemma2_path: '',
+            lumina_vae_path: ''
         },
         venv_path: path.join(ROOT_DIR, 'venv')
     };
 }
+
+// Serve architecture registry to frontend
+app.get('/api/architectures', (req, res) => {
+    res.json(ARCH_REGISTRY);
+});
 
 app.get('/api/gpu/activity', (req, res) => {
     const activity = {};
@@ -289,12 +330,11 @@ function buildTrainingConfig(jobName, jobPath) {
     // Build the merged config
     const merged = {};
 
-    // Model arguments from global config
-    merged.model_arguments = {
-        dit_path: globalConfig.model_paths?.dit_path || '',
-        qwen3_path: globalConfig.model_paths?.qwen3_path || '',
-        vae_path: globalConfig.model_paths?.vae_path || ''
-    };
+    // Resolve architecture from job config
+    const arch = getArchForJob(jobConfig);
+
+    // Model arguments from global config, mapped through registry
+    merged.model_arguments = buildModelArgs(arch, globalConfig);
 
     // Dataset arguments
     merged.dataset_arguments = {
@@ -354,6 +394,11 @@ function buildTrainingConfig(jobName, jobPath) {
     // Anima arguments
     if (jobConfig.anima_arguments) {
         merged.anima_arguments = { ...jobConfig.anima_arguments };
+    }
+
+    // Lumina arguments
+    if (jobConfig.lumina_arguments) {
+        merged.lumina_arguments = { ...jobConfig.lumina_arguments };
     }
 
     return merged;
@@ -884,12 +929,15 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
         const globalConfig = getGlobalConfig();
         const venvPath = globalConfig.venv_path || path.join(ROOT_DIR, 'venv');
         const venv = getVenvPaths(venvPath);
-        const genScript = path.join(ROOT_DIR, 'anima_gen.py');
+
+        // Resolve architecture from job config
+        const genArch = getArchForJob(mergedConfig);
+        const genScript = path.join(ROOT_DIR, genArch.scripts.generate);
 
         // Extract args
         const mArgs = mergedConfig.model_arguments;
         const tArgs = mergedConfig.training_arguments;
-        const aArgs = mergedConfig.anima_arguments || {};
+        const archSection = mergedConfig[genArch.training_section] || {};
 
         // Read config to check for GPU IDs - prefer gen-specific GPU selection
         let gpuEnv = '';
@@ -907,18 +955,31 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
             }
         }
 
-        const args = [
-            `--dit_path="${mArgs.dit_path}"`,
-            `--qwen3_path="${mArgs.qwen3_path}"`,
-            `--vae_path="${mArgs.vae_path}"`,
+        // Build model path args from registry
+        const args = [];
+        for (const [configKey, pathDef] of Object.entries(genArch.global_paths)) {
+            const val = mArgs[pathDef.cli_flag] || '';
+            args.push(`--${pathDef.cli_flag}="${val}"`);
+        }
+
+        // Add common args
+        args.push(
             `--sample_prompts="${promptsPath}"`,
             `--output_dir="${outputDir}"`,
             `--output_name="${tArgs.output_name || 'baseline'}"`,
             `--mixed_precision="${tArgs.mixed_precision || 'bf16'}"`,
-            `--seed=${tArgs.seed || 42}`,
-            `--discrete_flow_shift=${aArgs.discrete_flow_shift || 3.0}`,
-            `--timestep_sample_method="${aArgs.timestep_sample_method || 'logit_normal'}"`
-        ];
+            `--seed=${tArgs.seed || 42}`
+        );
+
+        // Add architecture-specific gen params from registry defaults + job overrides
+        for (const [paramKey, paramDef] of Object.entries(genArch.gen_params || {})) {
+            const val = req.body[paramKey] ?? archSection[paramKey] ?? paramDef.default;
+            if (paramDef.type === 'text') {
+                if (val) args.push(`--${paramDef.cli_flag}="${val}"`);
+            } else {
+                args.push(`--${paramDef.cli_flag}=${val}`);
+            }
+        }
 
         // Attention support
         if (req.body.flash_attn) {
@@ -1197,12 +1258,18 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             accelerateFlags += ' --dynamo_backend inductor';
         }
 
+        // Determine target script from architecture registry
+        const jobArch = getArchForJob(mergedConfig);
+        const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
+        const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+        const targetScript = path.join(ROOT_DIR, scriptName);
+
         // Spawn training process
         const trainEnvVars = [
             buildEnvVar('PYTHONIOENCODING', 'utf-8'),
             gpuEnv
         ].filter(Boolean).join('\n');
-        const trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${TRAINING_SCRIPT}" --config_file="${mergedConfigPath}"`;
+        const trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
         const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
 
         const proc = spawnShell(trainScript, ROOT_DIR);

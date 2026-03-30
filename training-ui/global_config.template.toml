@@ -1,10 +1,15 @@
 venv_path = ""
 
 [model_paths]
-# Absolute paths to your model files. Use double backslashes for Windows paths.
+# Anima Paths
 dit_path = ""
 qwen3_path = ""
 vae_path = ""
+
+# Lumina Paths
+lumina_dit_path = ""
+gemma2_path = ""
+lumina_vae_path = ""
 
 [ui]
 background = ""

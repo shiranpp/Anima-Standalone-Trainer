@@ -13,6 +13,7 @@ let samplesPollTimer = null;
 let isDraggingBg = false;
 let bgPosPercent = { x: 50, y: 50 };
 let currentSubsets = [];
+let archRegistry = null; // Loaded from /api/architectures
 
 // --- DOM Refs ---
 const $ = (id) => document.getElementById(id);
@@ -2049,11 +2050,117 @@ function applyTheme(theme) {
     localStorage.setItem('ui_theme', t);
 }
 
+// Build dynamic global settings tabs from architecture registry
+function buildGlobalSettingsTabs(registry) {
+    const nav = $('global-tabs-nav');
+    const content = $('global-tabs-content');
+
+    // Clear old dynamic tabs (keep the static Application tab)
+    nav.innerHTML = '';
+    content.querySelectorAll('.gtab-pane-dynamic').forEach(el => el.remove());
+
+    const archs = registry.architectures;
+    let isFirst = true;
+
+    for (const [archId, arch] of Object.entries(archs)) {
+        // Tab button
+        const btn = document.createElement('button');
+        btn.className = 'tab' + (isFirst ? ' active' : '');
+        btn.dataset.gtab = archId;
+        btn.textContent = arch.display_name + ' Models';
+        nav.appendChild(btn);
+
+        // Tab pane
+        const pane = document.createElement('div');
+        pane.id = `gtab-${archId}`;
+        pane.className = 'gtab-pane gtab-pane-dynamic' + (isFirst ? ' active' : ' hidden');
+
+        for (const [configKey, pathDef] of Object.entries(arch.global_paths)) {
+            const group = document.createElement('div');
+            group.className = 'form-group';
+            group.innerHTML = `
+                <label>${pathDef.label}</label>
+                <input type="text" id="cfg-global-${configKey}" placeholder="${pathDef.placeholder}">
+            `;
+            pane.appendChild(group);
+        }
+
+        // All-in-One sync button
+        if (arch.all_in_one && arch.all_in_one_source_key) {
+            const syncGroup = document.createElement('div');
+            syncGroup.style.marginTop = '8px';
+            syncGroup.innerHTML = `
+                <button class="btn btn-secondary btn-sm" id="btn-sync-${archId}">\uD83D\uDD04 Use as All-in-One Checkpoint</button>
+                <small style="display: block; margin-top: 4px;">Copies the first path to all other fields for this architecture.</small>
+            `;
+            pane.appendChild(syncGroup);
+        }
+
+        // Insert before the static Application tab
+        content.insertBefore(pane, $('gtab-app'));
+        isFirst = false;
+    }
+
+    // Application tab button (always last)
+    const appBtn = document.createElement('button');
+    appBtn.className = 'tab';
+    appBtn.dataset.gtab = 'app';
+    appBtn.textContent = 'Application';
+    nav.appendChild(appBtn);
+
+    // Bind tab switching
+    nav.querySelectorAll('.tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            nav.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            content.querySelectorAll('.gtab-pane, .gtab-pane-dynamic').forEach(p => {
+                p.classList.remove('active');
+                p.classList.add('hidden');
+            });
+            tab.classList.add('active');
+            const pane = $(`gtab-${tab.dataset.gtab}`);
+            if (pane) {
+                pane.classList.remove('hidden');
+                pane.classList.add('active');
+            }
+        });
+    });
+
+    // Bind all-in-one sync buttons
+    for (const [archId, arch] of Object.entries(archs)) {
+        if (arch.all_in_one && arch.all_in_one_source_key) {
+            const syncBtn = $(`btn-sync-${archId}`);
+            if (syncBtn) {
+                syncBtn.addEventListener('click', () => {
+                    const sourceInput = $(`cfg-global-${arch.all_in_one_source_key}`);
+                    if (sourceInput && sourceInput.value) {
+                        for (const configKey of Object.keys(arch.global_paths)) {
+                            $(`cfg-global-${configKey}`).value = sourceInput.value;
+                        }
+                        showToast(`${arch.display_name} paths synced!`);
+                    }
+                });
+            }
+        }
+    }
+}
+
 async function loadGlobalSettings() {
+    // Fetch registry if not cached
+    if (!archRegistry) {
+        archRegistry = await api('/api/architectures');
+        buildGlobalSettingsTabs(archRegistry);
+    }
+
     const config = await api('/api/global-config');
-    $('cfg-global-dit').value = config.model_paths?.dit_path || '';
-    $('cfg-global-qwen3').value = config.model_paths?.qwen3_path || '';
-    $('cfg-global-vae').value = config.model_paths?.vae_path || '';
+
+    // Populate path inputs dynamically from registry
+    for (const [archId, arch] of Object.entries(archRegistry.architectures)) {
+        for (const configKey of Object.keys(arch.global_paths)) {
+            const input = $(`cfg-global-${configKey}`);
+            if (input) input.value = config.model_paths?.[configKey] || '';
+        }
+    }
+
     $('cfg-global-venv').value = config.venv_path || '';
 
     // Theme
@@ -2090,12 +2197,19 @@ async function saveGlobalSettings() {
     // Read existing config first to preserve bg settings
     const existingConfig = await api('/api/global-config');
 
+    // Build model_paths dynamically from registry
+    const model_paths = {};
+    if (archRegistry) {
+        for (const [archId, arch] of Object.entries(archRegistry.architectures)) {
+            for (const configKey of Object.keys(arch.global_paths)) {
+                const input = $(`cfg-global-${configKey}`);
+                if (input) model_paths[configKey] = input.value;
+            }
+        }
+    }
+
     const config = {
-        model_paths: {
-            dit_path: $('cfg-global-dit').value,
-            qwen3_path: $('cfg-global-qwen3').value,
-            vae_path: $('cfg-global-vae').value
-        },
+        model_paths,
         venv_path: $('cfg-global-venv').value,
         ui: {
             ...(existingConfig.ui || {}),
@@ -2332,8 +2446,11 @@ function escapeHtml(str) {
 // ==========================================
 
 document.querySelectorAll('.tab').forEach(tab => {
+    // don't attach this listener if it's a global tab
+    if (tab.closest('#global-tabs-nav')) return;
+
     tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab:not(#global-tabs-nav .tab)').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab-pane').forEach(p => {
             p.classList.remove('active');
             p.classList.add('hidden');
@@ -2360,6 +2477,9 @@ document.querySelectorAll('.tab').forEach(tab => {
         if (tab.dataset.tab === 'tensorboard') checkTensorBoard();
     });
 });
+
+// Global tab switching and sync buttons are now handled
+// dynamically inside buildGlobalSettingsTabs()
 
 // ==========================================
 //  Event Listeners

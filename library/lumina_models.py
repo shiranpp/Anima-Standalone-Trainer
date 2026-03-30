@@ -1287,14 +1287,12 @@ class NextDiT(nn.Module):
             num_blocks (int): Number of blocks to swap between CPU and device
             device (torch.device): Device to use for computation
         """
+        max_blocks = max(0, len(self.layers) - 2)
+        if blocks_to_swap > max_blocks:
+            print(f"Warning: blocks_to_swap ({blocks_to_swap}) is greater than available main blocks ({max_blocks}). Clamping to {max_blocks}.")
+            blocks_to_swap = max_blocks
+
         self.blocks_to_swap = blocks_to_swap
-        
-        # Calculate how many blocks to swap from main layers
-        
-        assert blocks_to_swap <= len(self.layers) - 2, (
-            f"Cannot swap more than {len(self.layers) - 2} main blocks. "
-            f"Requested {blocks_to_swap} blocks."
-        )
         
         self.offloader_main = custom_offloading_utils.ModelOffloader(
             self.layers, blocks_to_swap, device, debug=False

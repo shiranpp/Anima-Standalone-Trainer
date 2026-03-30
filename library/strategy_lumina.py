@@ -22,13 +22,17 @@ logger = logging.getLogger(__name__)
 
 GEMMA_ID = "google/gemma-2-2b"
 
+# Prefer local tokenizer config to avoid HuggingFace auth issues with gated models
+_LOCAL_GEMMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs", "gemma-2-2b")
+GEMMA_TOKENIZER_PATH = _LOCAL_GEMMA_DIR if os.path.isdir(_LOCAL_GEMMA_DIR) else GEMMA_ID
+
 
 class LuminaTokenizeStrategy(TokenizeStrategy):
     def __init__(
         self, system_prompt:str, max_length: Optional[int], tokenizer_cache_dir: Optional[str] = None
     ) -> None:
         self.tokenizer: GemmaTokenizerFast = AutoTokenizer.from_pretrained(
-            GEMMA_ID, cache_dir=tokenizer_cache_dir
+            GEMMA_TOKENIZER_PATH, cache_dir=tokenizer_cache_dir
         )
         self.tokenizer.padding_side = "right"
 
@@ -108,7 +112,8 @@ class LuminaTextEncodingStrategy(TextEncodingStrategy):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 hidden_states, input_ids, attention_masks
         """
-        text_encoder = models[0]
+        # Handle both list of models (standard) and single model object (convenience)
+        text_encoder = models[0] if isinstance(models, (list, tuple)) else models
         # Check model or torch dynamo OptimizedModule
         assert isinstance(text_encoder, Gemma2Model) or isinstance(text_encoder._orig_mod, Gemma2Model), f"text encoder is not Gemma2Model {text_encoder.__class__.__name__}"
         input_ids, attention_masks = tokens

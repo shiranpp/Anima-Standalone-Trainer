@@ -1,0 +1,100 @@
+{
+  "architectures": {
+    "anima": {
+      "display_name": "Anima",
+      "network_modules": ["networks.lora_anima"],
+      "scripts": {
+        "train": "anima_train.py",
+        "train_network": "anima_train_network.py",
+        "generate": "anima_gen.py"
+      },
+      "global_paths": {
+        "dit_path": {
+          "label": "DiT Model Path",
+          "placeholder": "C:\\Anima\\split_files\\diffusion_models\\anima-preview.safetensors",
+          "cli_flag": "dit_path"
+        },
+        "qwen3_path": {
+          "label": "Qwen3 Text Encoder Path",
+          "placeholder": "C:\\Anima\\split_files\\text_encoders\\qwen_3_06b_base.safetensors",
+          "cli_flag": "qwen3_path"
+        },
+        "vae_path": {
+          "label": "VAE Path",
+          "placeholder": "C:\\Anima\\split_files\\vae\\qwen_image_vae.safetensors",
+          "cli_flag": "vae_path"
+        }
+      },
+      "gen_params": {
+        "flow_shift": {
+          "label": "Flow Shift",
+          "type": "number",
+          "default": 3.0,
+          "step": 0.5,
+          "cli_flag": "discrete_flow_shift"
+        }
+      },
+      "training_section": "anima_arguments",
+      "all_in_one": false
+    },
+    "lumina": {
+      "display_name": "Lumina",
+      "network_modules": ["networks.lora_lumina"],
+      "scripts": {
+        "train": "lumina_train.py",
+        "train_network": "lumina_train_network.py",
+        "generate": "lumina_gen.py"
+      },
+      "global_paths": {
+        "lumina_dit_path": {
+          "label": "Lumina DiT Model Path",
+          "placeholder": "C:\\ComfyUI\\models\\checkpoints\\netayumeLumina.safetensors",
+          "cli_flag": "dit_path"
+        },
+        "gemma2_path": {
+          "label": "Gemma 2 Text Encoder Path",
+          "placeholder": "C:\\ComfyUI\\models\\text_encoders\\gemma-2b-it.safetensors",
+          "cli_flag": "gemma2"
+        },
+        "lumina_vae_path": {
+          "label": "Lumina VAE Path",
+          "placeholder": "C:\\ComfyUI\\models\\vae\\lumina_vae.safetensors",
+          "cli_flag": "ae"
+        }
+      },
+      "gen_params": {
+        "discrete_flow_shift": {
+          "label": "Discrete Flow Shift",
+          "type": "number",
+          "default": 6.0,
+          "step": 0.5,
+          "cli_flag": "discrete_flow_shift"
+        },
+        "cfg_trunc_ratio": {
+          "label": "CFG Truncation Ratio",
+          "type": "number",
+          "default": 0.25,
+          "step": 0.05,
+          "cli_flag": "cfg_trunc_ratio"
+        },
+        "renorm_cfg": {
+          "label": "Renorm CFG",
+          "type": "number",
+          "default": 1.0,
+          "step": 0.1,
+          "cli_flag": "renorm_cfg"
+        },
+        "system_prompt": {
+          "label": "System Prompt",
+          "type": "text",
+          "default": "",
+          "cli_flag": "system_prompt"
+        }
+      },
+      "training_section": "lumina_arguments",
+      "all_in_one": true,
+      "all_in_one_source_key": "lumina_dit_path"
+    }
+  },
+  "default_architecture": "anima"
+}

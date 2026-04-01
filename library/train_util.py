@@ -5454,7 +5454,7 @@ def prepare_accelerator(args: argparse.Namespace):
             rank = int(os.environ.get("RANK", "0"))
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
             _win_backend = "gloo"
-            if getattr(args, "use_cuda_direct", False):
+            if getattr(args, "use_cuda_direct", False) and torch.cuda.device_count() > 1:
                 try:
                     from cuda_direct_backend.auto import activate
                     activate()
@@ -5462,6 +5462,8 @@ def prepare_accelerator(args: argparse.Namespace):
                     print("cuda_direct backend activated for Windows multi-GPU training.")
                 except ImportError:
                     print("WARNING: --use_cuda_direct specified but cuda_direct_backend is not installed. Falling back to Gloo.")
+            elif getattr(args, "use_cuda_direct", False):
+                print("WARNING: --use_cuda_direct ignored, requires 2+ GPUs. Falling back to Gloo.")
             dist.init_process_group(backend=_win_backend, rank=rank, world_size=world_size)
 
 
@@ -5499,7 +5501,7 @@ def prepare_accelerator(args: argparse.Namespace):
     if args.torch_compile:
         dynamo_backend = args.dynamo_backend
 
-    _use_cuda_direct = getattr(args, "use_cuda_direct", False) and os.name == "nt"
+    _use_cuda_direct = getattr(args, "use_cuda_direct", False) and os.name == "nt" and torch.cuda.device_count() > 1
     if _use_cuda_direct:
         try:
             from cuda_direct_backend.auto import activate
@@ -5507,6 +5509,8 @@ def prepare_accelerator(args: argparse.Namespace):
         except ImportError:
             print("WARNING: --use_cuda_direct specified but cuda_direct_backend is not installed. Falling back to Gloo.")
             _use_cuda_direct = False
+    elif getattr(args, "use_cuda_direct", False) and torch.cuda.device_count() <= 1:
+        print("WARNING: --use_cuda_direct ignored, requires 2+ GPUs. Falling back to Gloo.")
 
     def _win_backend():
         if _use_cuda_direct:

@@ -3855,6 +3855,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="enable per-step profiling (wall, fwd, bwd, comm, opt times)",
     )
     parser.add_argument(
+        "--profile_microbatch",
+        action="store_true",
+        help="when step profiling is enabled, also print per-microbatch fwd/bwd breakdown",
+    )
+    parser.add_argument(
         "--save_every_n_epochs",
         type=int,
         default=None,

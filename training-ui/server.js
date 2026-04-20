@@ -947,74 +947,76 @@ function buildEnvVar(name, value) {
 
 // Returns { gpuEnv, accelerateFlags, tpTrainCmd } or { error }
 function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
-    if (!gpuIds) return { gpuEnv: '', accelerateFlags: '', tpTrainCmd: null };
-
-    if (!/^[\d\s,]+$/.test(gpuIds))
-        return { error: `Invalid GPU IDs format: "${gpuIds}". Use numbers separated by commas (e.g. "0,1").` };
-
-    const validIds = gpuIds.split(',').map(s => s.trim()).filter(Boolean);
-    if (validIds.some(id => isNaN(parseInt(id))))
-        return { error: 'GPU IDs must be valid numbers.' };
-
-    const gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', validIds.join(','));
     const ta = mergedConfig.training_arguments || {};
     const mixedPrec = ta.mixed_precision || 'bf16';
     const mode = ta.multigpu_mode || (ta.use_fsdp ? 'fsdp' : 'ddp');
 
+    let gpuEnv = '';
     let accelerateFlags = '';
     let tpTrainCmd = null;
 
-    if (validIds.length > 1) {
-        if (mode === 'tp_sp') {
-            const tpScript = jobArch.scripts?.train_network_tp_sp;
-            if (!tpScript)
-                return { error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.` };
-            const n = validIds.length;
-            const target = path.join(ROOT_DIR, tpScript);
-            tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n}${ta.sequence_parallel ? ' --sequence_parallel' : ''} --config_file="${mergedConfigPath}"`;
+    if (gpuIds) {
+        if (!/^[\d\s,]+$/.test(gpuIds))
+            return { error: `Invalid GPU IDs format: "${gpuIds}". Use numbers separated by commas (e.g. "0,1").` };
 
-        } else if (mode === 'fsdp2') {
-            const reshard = ta.fsdp2_reshard_after_forward ?? true;
-            accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
-            accelerateFlags += ` --fsdp_reshard_after_forward ${reshard ? 'true' : 'false'}`;
-            if (ta.fsdp2_cpu_ram_efficient_loading)  accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
-            if (ta.fsdp2_offload_params)             accelerateFlags += ` --fsdp_offload_params true`;
-            if (ta.fsdp2_activation_checkpointing)   accelerateFlags += ` --fsdp_activation_checkpointing true`;
-            if (ta.fsdp2_auto_wrap_policy && ta.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
-                accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp2_auto_wrap_policy}`;
-                if (ta.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && ta.fsdp2_min_num_params)
-                    accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp2_min_num_params}`;
-                if (ta.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                    const cls = (ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
-                    if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+        const validIds = gpuIds.split(',').map(s => s.trim()).filter(Boolean);
+        if (validIds.some(id => isNaN(parseInt(id))))
+            return { error: 'GPU IDs must be valid numbers.' };
+
+        gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', validIds.join(','));
+
+        if (validIds.length > 1) {
+            if (mode === 'tp_sp') {
+                const tpScript = jobArch.scripts?.train_network_tp_sp;
+                if (!tpScript)
+                    return { error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.` };
+                const n = validIds.length;
+                const target = path.join(ROOT_DIR, tpScript);
+                tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n}${ta.sequence_parallel ? ' --sequence_parallel' : ''} --config_file="${mergedConfigPath}"`;
+
+            } else if (mode === 'fsdp2') {
+                const reshard = ta.fsdp2_reshard_after_forward ?? true;
+                accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                accelerateFlags += ` --fsdp_reshard_after_forward ${reshard ? 'true' : 'false'}`;
+                if (ta.fsdp2_cpu_ram_efficient_loading)  accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+                if (ta.fsdp2_offload_params)             accelerateFlags += ` --fsdp_offload_params true`;
+                if (ta.fsdp2_activation_checkpointing)   accelerateFlags += ` --fsdp_activation_checkpointing true`;
+                if (ta.fsdp2_auto_wrap_policy && ta.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
+                    accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp2_auto_wrap_policy}`;
+                    if (ta.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && ta.fsdp2_min_num_params)
+                        accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp2_min_num_params}`;
+                    if (ta.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
+                        const cls = (ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+                    }
                 }
-            }
 
-        } else if (mode === 'fsdp') {
-            accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
-            accelerateFlags += ` --fsdp_sharding_strategy ${ta.fsdp_sharding_strategy || 1}`;
-            // sync_module_states must accompany cpu_ram_efficient_loading
-            if (ta.fsdp_cpu_ram_efficient_loading)   accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
-            if (ta.fsdp_offload_params)              accelerateFlags += ` --fsdp_offload_params true`;
-            if (ta.fsdp_reshard_after_forward)       accelerateFlags += ` --fsdp_reshard_after_forward true`;
-            if (ta.fsdp_activation_checkpointing)    accelerateFlags += ` --fsdp_activation_checkpointing true`;
-            if (ta.fsdp_backward_prefetch)           accelerateFlags += ` --fsdp_backward_prefetch ${ta.fsdp_backward_prefetch}`;
-            if (ta.fsdp_forward_prefetch)            accelerateFlags += ` --fsdp_forward_prefetch true`;
-            if (ta.fsdp_use_orig_params === false)   accelerateFlags += ` --fsdp_use_orig_params false`;
-            if (ta.fsdp_min_num_params)              accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp_min_num_params}`;
-            if (ta.fsdp_auto_wrap_policy) {
-                accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp_auto_wrap_policy}`;
-                if (ta.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                    const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
-                    if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+            } else if (mode === 'fsdp') {
+                accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                accelerateFlags += ` --fsdp_sharding_strategy ${ta.fsdp_sharding_strategy || 1}`;
+                // sync_module_states must accompany cpu_ram_efficient_loading
+                if (ta.fsdp_cpu_ram_efficient_loading)   accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+                if (ta.fsdp_offload_params)              accelerateFlags += ` --fsdp_offload_params true`;
+                if (ta.fsdp_reshard_after_forward)       accelerateFlags += ` --fsdp_reshard_after_forward true`;
+                if (ta.fsdp_activation_checkpointing)    accelerateFlags += ` --fsdp_activation_checkpointing true`;
+                if (ta.fsdp_backward_prefetch)           accelerateFlags += ` --fsdp_backward_prefetch ${ta.fsdp_backward_prefetch}`;
+                if (ta.fsdp_forward_prefetch)            accelerateFlags += ` --fsdp_forward_prefetch true`;
+                if (ta.fsdp_use_orig_params === false)   accelerateFlags += ` --fsdp_use_orig_params false`;
+                if (ta.fsdp_min_num_params)              accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp_min_num_params}`;
+                if (ta.fsdp_auto_wrap_policy) {
+                    accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp_auto_wrap_policy}`;
+                    if (ta.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
+                        const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+                    }
                 }
-            }
 
+            } else {
+                accelerateFlags = `--multi_gpu --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+            }
         } else {
-            accelerateFlags = `--multi_gpu --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+            accelerateFlags = `--mixed_precision ${mixedPrec}`;
         }
-    } else {
-        accelerateFlags = `--mixed_precision ${mixedPrec}`;
     }
 
     if (ta.torch_compile && mode !== 'tp_sp' && mode !== 'fsdp2')

@@ -10,8 +10,8 @@
 #
 # The TP sharding happens inside load_target_model():
 #   1. Parent loads the model normally (cpu)
-#   2. wd_parallel shards projection weights across TP ranks
-#      (QKV is NOT fused - keeps standard key names for LoRA compatibility)
+#   2. Q/K/V projections are fused internally, then wd_parallel shards them
+#      as packed QKV/KV column-parallel weights.
 #   3. LoRA network creation (in the parent's train()) then wraps the sharded layers
 #      using TP-aware LoRA modules that handle SP communication automatically
 #
@@ -19,7 +19,7 @@
 #   - Accelerator distributed_type is set to NO so DDP doesn't wrap the LoRA
 #     network or shard the dataloader (TP needs same batch on all ranks)
 #   - LoRA gradient sync uses wdp.sync_replicated_grads() instead of DDP
-#   - Saved LoRA is gathered from all TP ranks into standard format (rank 0 saves)
+#   - Saved LoRA is gathered from all TP ranks into standard q/k/v format (rank 0 saves)
 #   - Sample generation is skipped (TP forward needs all ranks in collectives)
 
 import argparse
@@ -115,21 +115,146 @@ def _infer_anima_tp_padding_geometry(dit: torch.nn.Module, tp_size: int) -> dict
     }
 
 
+def fuse_qkv_for_tp_lora(model: torch.nn.Module, *, include_llm_adapter: bool = True) -> int:
+    """Fuse Anima attention projections before TP sharding.
+
+    The fusion is internal to the TP/SP LoRA trainer.  LoRA save/load translates
+    packed module names back to the standard q_proj/k_proj/v_proj checkpoint
+    keys, so inference compatibility is preserved.
+    """
+    import types
+    from einops import rearrange
+    from library.anima_models import Attention, LLMAdapterAttention, apply_rotary_pos_emb, _adapter_apply_rotary_pos_emb
+    import torch.nn.functional as F
+
+    def _fused_self_attn_compute_qkv(self, x, context=None, rope_emb=None):
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        n_h = q.shape[-1] // self.head_dim
+        q, k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=n_h, d=self.head_dim),
+            (q, k, v),
+        )
+        q, k, v = self.q_norm(q), self.k_norm(k), self.v_norm(v)
+        if rope_emb is not None:
+            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
+            k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
+        return q, k, v
+
+    def _fused_cross_attn_compute_qkv(self, x, context=None, rope_emb=None):
+        q = self.q_proj(x)
+        ctx = x if context is None else context
+        k, v = self.kv_proj(ctx).chunk(2, dim=-1)
+        n_h = q.shape[-1] // self.head_dim
+        q, k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=n_h, d=self.head_dim),
+            (q, k, v),
+        )
+        return self.q_norm(q), self.k_norm(k), self.v_norm(v)
+
+    def _fused_adapter_forward(self, x, mask=None, context=None, position_embeddings=None, position_embeddings_context=None):
+        context = x if context is None else context
+        input_shape = x.shape[:-1]
+        q_shape = (*input_shape, self.n_heads, self.head_dim)
+        context_shape = context.shape[:-1]
+        kv_shape = (*context_shape, self.n_heads, self.head_dim)
+
+        if hasattr(self, "qkv_proj"):
+            q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        else:
+            q = self.q_proj(x)
+            k, v = self.kv_proj(context).chunk(2, dim=-1)
+
+        query_states = self.q_norm(q.view(q_shape)).transpose(1, 2)
+        key_states = self.k_norm(k.view(kv_shape)).transpose(1, 2)
+        value_states = v.view(kv_shape).transpose(1, 2)
+
+        if position_embeddings is not None:
+            assert position_embeddings_context is not None
+            cos, sin = position_embeddings
+            query_states = _adapter_apply_rotary_pos_emb(query_states, cos, sin)
+            cos, sin = position_embeddings_context
+            key_states = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
+
+        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        return self.o_proj(attn_output)
+
+    def _fuse_main_attention(attn: Attention) -> bool:
+        if hasattr(attn, "qkv_proj") or hasattr(attn, "kv_proj"):
+            return False
+        if attn.is_selfattn:
+            fused_w = torch.cat([attn.q_proj.weight.data, attn.k_proj.weight.data, attn.v_proj.weight.data], dim=0)
+            attn.qkv_proj = torch.nn.Linear(
+                attn.q_proj.in_features,
+                fused_w.shape[0],
+                bias=False,
+                device=attn.q_proj.weight.device,
+                dtype=attn.q_proj.weight.dtype,
+            )
+            attn.qkv_proj.weight = torch.nn.Parameter(fused_w)
+            del attn.q_proj, attn.k_proj, attn.v_proj
+            attn.compute_qkv = types.MethodType(_fused_self_attn_compute_qkv, attn)
+        else:
+            fused_w = torch.cat([attn.k_proj.weight.data, attn.v_proj.weight.data], dim=0)
+            attn.kv_proj = torch.nn.Linear(
+                attn.k_proj.in_features,
+                fused_w.shape[0],
+                bias=False,
+                device=attn.k_proj.weight.device,
+                dtype=attn.k_proj.weight.dtype,
+            )
+            attn.kv_proj.weight = torch.nn.Parameter(fused_w)
+            del attn.k_proj, attn.v_proj
+            attn.compute_qkv = types.MethodType(_fused_cross_attn_compute_qkv, attn)
+        return True
+
+    def _fuse_adapter_attention(attn: LLMAdapterAttention, *, is_self_attn: bool) -> bool:
+        if hasattr(attn, "qkv_proj") or hasattr(attn, "kv_proj"):
+            return False
+        if is_self_attn:
+            fused_w = torch.cat([attn.q_proj.weight.data, attn.k_proj.weight.data, attn.v_proj.weight.data], dim=0)
+            attn.qkv_proj = torch.nn.Linear(
+                attn.q_proj.in_features,
+                fused_w.shape[0],
+                bias=False,
+                device=attn.q_proj.weight.device,
+                dtype=attn.q_proj.weight.dtype,
+            )
+            attn.qkv_proj.weight = torch.nn.Parameter(fused_w)
+            del attn.q_proj, attn.k_proj, attn.v_proj
+        else:
+            fused_w = torch.cat([attn.k_proj.weight.data, attn.v_proj.weight.data], dim=0)
+            attn.kv_proj = torch.nn.Linear(
+                attn.k_proj.in_features,
+                fused_w.shape[0],
+                bias=False,
+                device=attn.k_proj.weight.device,
+                dtype=attn.k_proj.weight.dtype,
+            )
+            attn.kv_proj.weight = torch.nn.Parameter(fused_w)
+            del attn.k_proj, attn.v_proj
+        attn.forward = types.MethodType(_fused_adapter_forward, attn)
+        return True
+
+    fused_count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, Attention):
+            fused_count += int(_fuse_main_attention(module))
+        elif include_llm_adapter and isinstance(module, LLMAdapterAttention):
+            fused_count += int(_fuse_adapter_attention(module, is_self_attn=name.endswith(".self_attn")))
+    return fused_count
+
+
 def _make_anima_lora_tp_spec(
     sequence_parallel: bool = False,
     use_llm_adapter: bool = False,
     *,
     allow_padding: bool = True,
     padding_multiple: int = 1,
+    fuse_qkv: bool = True,
 ):
-    """TP spec for Anima LoRA - targets UNFUSED projections.
-
-    Unlike the full-finetune TP spec (which fuses q/k/v into qkv_proj),
-    LoRA must keep separate q_proj/k_proj/v_proj so that the saved LoRA
-    has standard key names compatible with non-TP inference.
-
-    This costs 3 all-gathers per self-attn block instead of 1, but for
-    LoRA the extra communication is negligible relative to the matmuls.
+    """TP spec for Anima LoRA.
 
     LLM Adapter (use_llm_adapter=True): shards the 6-block cross-attention
     transformer that bridges Qwen3 -> T5 space.  Adapter self-attn uses SP
@@ -150,21 +275,37 @@ def _make_anima_lora_tp_spec(
         allow_padding=allow_padding,
         padding_multiple=padding_multiple,
     )
-    entries = {
-        # Self-attention: individual projections (no QKV fusion)
-        "blocks.*.self_attn.q_proj":       col(sp),
-        "blocks.*.self_attn.k_proj":       col(sp),
-        "blocks.*.self_attn.v_proj":       col(sp),
-        "blocks.*.self_attn.output_proj":  row(sp),
-        # Cross-attention: k/v use replicated context (never SP)
-        "blocks.*.cross_attn.q_proj":      col(sp),
-        "blocks.*.cross_attn.k_proj":      col(False),
-        "blocks.*.cross_attn.v_proj":      col(False),
-        "blocks.*.cross_attn.output_proj": row(sp),
+    packed_col = lambda sp_flag, parts: wdp.PackedColumnParallelSpec(
+        sequence_parallel=sp_flag,
+        seq_dim=1,
+        packed_parts=parts,
+        allow_padding=allow_padding,
+        padding_multiple=padding_multiple,
+    )
+    if fuse_qkv:
+        entries = {
+            "blocks.*.self_attn.qkv_proj":    packed_col(sp, 3),
+            "blocks.*.self_attn.output_proj": row(sp),
+            "blocks.*.cross_attn.q_proj":     col(sp),
+            "blocks.*.cross_attn.kv_proj":    packed_col(False, 2),
+            "blocks.*.cross_attn.output_proj": row(sp),
+        }
+    else:
+        entries = {
+            "blocks.*.self_attn.q_proj":       col(sp),
+            "blocks.*.self_attn.k_proj":       col(sp),
+            "blocks.*.self_attn.v_proj":       col(sp),
+            "blocks.*.self_attn.output_proj":  row(sp),
+            "blocks.*.cross_attn.q_proj":      col(sp),
+            "blocks.*.cross_attn.k_proj":      col(False),
+            "blocks.*.cross_attn.v_proj":      col(False),
+            "blocks.*.cross_attn.output_proj": row(sp),
+        }
+    entries.update({
         # MLP
         "blocks.*.mlp.layer1":             col(sp),
         "blocks.*.mlp.layer2":             row(sp),
-    }
+    })
     if use_llm_adapter:
         # The LLM Adapter's T5 target sequence is REPLICATED on all TP ranks -
         # it is never scattered by SP.  Using col(sp) / row(sp) here would make
@@ -172,15 +313,26 @@ def _make_anima_lora_tp_spec(
         # the sequence (each rank provides its full copy -> 2x tokens) and causing
         # shape mismatches downstream.  Always use col(False) / row(False) so the
         # adapter runs plain column-parallel (no sequence gather/scatter).
+        if fuse_qkv:
+            entries.update({
+                "llm_adapter.blocks.*.self_attn.qkv_proj": packed_col(False, 3),
+                "llm_adapter.blocks.*.self_attn.o_proj":   row(False),
+                "llm_adapter.blocks.*.cross_attn.q_proj":  col(False),
+                "llm_adapter.blocks.*.cross_attn.kv_proj": packed_col(False, 2),
+                "llm_adapter.blocks.*.cross_attn.o_proj":  row(False),
+            })
+        else:
+            entries.update({
+                "llm_adapter.blocks.*.self_attn.q_proj":  col(False),
+                "llm_adapter.blocks.*.self_attn.k_proj":  col(False),
+                "llm_adapter.blocks.*.self_attn.v_proj":  col(False),
+                "llm_adapter.blocks.*.self_attn.o_proj":  row(False),
+                "llm_adapter.blocks.*.cross_attn.q_proj": col(False),
+                "llm_adapter.blocks.*.cross_attn.k_proj": col(False),
+                "llm_adapter.blocks.*.cross_attn.v_proj": col(False),
+                "llm_adapter.blocks.*.cross_attn.o_proj": row(False),
+            })
         entries.update({
-            "llm_adapter.blocks.*.self_attn.q_proj":  col(False),
-            "llm_adapter.blocks.*.self_attn.k_proj":  col(False),
-            "llm_adapter.blocks.*.self_attn.v_proj":  col(False),
-            "llm_adapter.blocks.*.self_attn.o_proj":  row(False),
-            "llm_adapter.blocks.*.cross_attn.q_proj": col(False),
-            "llm_adapter.blocks.*.cross_attn.k_proj": col(False),
-            "llm_adapter.blocks.*.cross_attn.v_proj": col(False),
-            "llm_adapter.blocks.*.cross_attn.o_proj": row(False),
             # MLP: Sequential[0]=Linear(D->4D), [2]=Linear(4D->D)
             "llm_adapter.blocks.*.mlp.0":             col(False),
             "llm_adapter.blocks.*.mlp.2":             row(False),
@@ -205,12 +357,20 @@ def _fixup_attention_heads_for_tp(model: torch.nn.Module) -> int:
     for module in model.modules():
         # Covers both main-model Attention (uses einops rearrange) and
         # LLMAdapterAttention (uses .view) - both break the same way after TP sharding.
-        if isinstance(module, (Attention, LLMAdapterAttention)) and isinstance(module.q_proj, ColumnParallelLinear):
-            local_width = int(module.q_proj.out_features)
+        proj = None
+        if hasattr(module, "q_proj") and isinstance(module.q_proj, ColumnParallelLinear):
+            proj = module.q_proj
+            local_width = int(proj.out_features)
+        elif hasattr(module, "qkv_proj") and isinstance(module.qkv_proj, ColumnParallelLinear):
+            proj = module.qkv_proj
+            local_width = int(getattr(proj, "local_part_size", proj.out_features // 3))
+        else:
+            continue
+        if isinstance(module, (Attention, LLMAdapterAttention)):
             mod_head_dim = int(module.head_dim)
             if local_width % mod_head_dim != 0:
                 raise ValueError(
-                    f"{type(module).__name__}: local q_proj width={local_width} "
+                    f"{type(module).__name__}: local q width={local_width} "
                     f"is not divisible by head_dim={mod_head_dim}"
                 )
             module.n_heads = local_width // mod_head_dim
@@ -227,12 +387,22 @@ def _tag_tp_lora_params(network: torch.nn.Module) -> tuple[int, int]:
     Row-parallel LoRA: lora_down is sharded; lora_up is replicated but
     receives partial feature/sequence gradients, so it needs SUM semantics.
     """
-    from networks.lora_anima import ColumnParallelLoRAModule, RowParallelLoRAModule
+    from networks.lora_anima import ColumnParallelLoRAModule, PackedColumnParallelLoRAModule, RowParallelLoRAModule
 
     sharded = 0
     partial = 0
     for lora in network.unet_loras:
-        if isinstance(lora, ColumnParallelLoRAModule):
+        if isinstance(lora, PackedColumnParallelLoRAModule):
+            for up in lora.lora_up:
+                for p in up.parameters():
+                    p._tp_sharded = True
+                    sharded += 1
+            for down in lora.lora_down:
+                for p in down.parameters():
+                    p._tp_sharded = False
+                    p._tp_partial_grad = True
+                    partial += 1
+        elif isinstance(lora, ColumnParallelLoRAModule):
             for p in lora.lora_up.parameters():
                 p._tp_sharded = True
                 sharded += 1
@@ -302,24 +472,27 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
     # ----- override: model loading + TP sharding -----
 
     def load_target_model(self, args, weight_dtype, accelerator):
-        """Load model normally, then apply TP sharding (no QKV fusion).
-
-        QKV is NOT fused for LoRA - this keeps standard key names so the
-        saved LoRA is compatible with non-TP inference pipelines.
-        """
+        """Load model normally, optionally fuse QKV, then apply TP sharding."""
         model_type, text_encoders, vae, dit = super().load_target_model(args, weight_dtype, accelerator)
 
         if self.tp_groups is not None and self.tp_groups.tp_size > 1:
             import wd_parallel as wdp
 
             tp_geometry = _infer_anima_tp_padding_geometry(dit, self.tp_groups.tp_size)
+            fuse_qkv = not getattr(args, "no_fuse_qkv", False)
+            fused_count = 0
+            if fuse_qkv:
+                fused_count = fuse_qkv_for_tp_lora(
+                    dit,
+                    include_llm_adapter=getattr(dit, "use_llm_adapter", False),
+                )
 
-            # Apply TP sharding with unfused spec (individual q/k/v projections)
             tp_spec = _make_anima_lora_tp_spec(
                 self.use_sp,
                 use_llm_adapter=getattr(dit, "use_llm_adapter", False),
                 allow_padding=True,
                 padding_multiple=tp_geometry["head_dim"],
+                fuse_qkv=fuse_qkv,
             )
             dit = wdp.apply_parallelism(dit, tp_spec, self.tp_config, self.tp_groups)
             self.tp_active = True
@@ -336,6 +509,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             logger.info(
                 f"TP sharding applied: tp_degree={self.tp_groups.tp_size}, sp={self.use_sp}, "
                 f"llm_adapter={getattr(dit, 'use_llm_adapter', False)}, "
+                f"fuse_qkv={fuse_qkv}, fused_attention_modules={fused_count}, "
                 f"attention_modules_patched={n_attn_fixed}, "
                 f"model_width={tp_geometry['model_channels']}->{tp_geometry['padded_width']}, "
                 f"local_width={tp_geometry['local_width']}, local_heads={tp_geometry['local_heads']}, "
@@ -344,7 +518,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             self._tp_diag(
                 args,
                 f"startup backend={dist.get_backend()} tp_degree={self.tp_groups.tp_size} sp={self.use_sp} "
-                f"llm_adapter={getattr(dit, 'use_llm_adapter', False)} attention_modules_patched={n_attn_fixed} "
+                f"llm_adapter={getattr(dit, 'use_llm_adapter', False)} fuse_qkv={fuse_qkv} "
+                f"fused_attention_modules={fused_count} attention_modules_patched={n_attn_fixed} "
                 f"model_width={tp_geometry['model_channels']} padded_width={tp_geometry['padded_width']} "
                 f"local_width={tp_geometry['local_width']} local_heads={tp_geometry['local_heads']} "
                 f"head_dim={tp_geometry['head_dim']} padding_added={tp_geometry['padding_added']} "
@@ -709,7 +884,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         # Reset diagnostic hook flags - tp_sp_verify calls LoRA module forward()
         # in training mode, which sets _hooks_registered=True on the class before
         # actual training starts, silencing all hooks for the real training run.
-        from networks.lora_anima import ColumnParallelLoRAModule, RowParallelLoRAModule
+        from networks.lora_anima import ColumnParallelLoRAModule, PackedColumnParallelLoRAModule, RowParallelLoRAModule
         ColumnParallelLoRAModule._hooks_registered = False
         RowParallelLoRAModule._hooks_registered = False
 
@@ -728,7 +903,19 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             # Avoid torch.distributed metadata calls here; CUDA Direct can hang in
             # group operations after the checkpoint write. We already know rank/size.
             for lora in network.text_encoder_loras + network.unet_loras:
-                if isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
+                if isinstance(lora, PackedColumnParallelLoRAModule) and lora._tp_group is not None:
+                    org_module = lora.org_module_ref[0]
+                    padded_part = int(getattr(org_module, "padded_part_size", 0) or 0)
+                    for up in lora.lora_up:
+                        w = up.weight.data
+                        if padded_part and w.shape[0] < padded_part:
+                            padded = w.new_zeros((padded_part, *w.shape[1:]))
+                            padded[:w.shape[0]] = w
+                            w = padded
+                        chunk = w.shape[0] // tp_size
+                        up.weight.data = w[tp_rank * chunk:(tp_rank + 1) * chunk].contiguous()
+
+                elif isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
                     w = lora.lora_up.weight.data
                     org_module = lora.org_module_ref[0]
                     padded_out = int(getattr(org_module, "padded_out_features", w.shape[0]))
@@ -917,6 +1104,10 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tp_verify_model_forward", action="store_true",
         help="Run the expensive full-DiT TP/SP forward diagnostic before training.",
+    )
+    parser.add_argument(
+        "--no_fuse_qkv", action="store_true",
+        help="Disable internal fused QKV/KV projections for TP/SP debugging.",
     )
     return parser
 

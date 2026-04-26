@@ -1457,6 +1457,8 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             delete mergedConfig.training_arguments.save_state_on_train_end;
             delete mergedConfig.training_arguments.save_last_n_steps_state;
             delete mergedConfig.training_arguments.save_last_n_epochs_state;
+        } else if (mergedConfig.training_arguments) {
+            delete mergedConfig.training_arguments.no_fuse_qkv;
         }
 
         // Convert Windows paths to WSL paths when running under WSL
@@ -2002,7 +2004,7 @@ setInterval(async () => {
             client.send(payload);
         }
     });
-}, 1000);
+}, 500);
 
 // Prevent server crash on unhandled errors
 process.on('uncaughtException', (err) => {

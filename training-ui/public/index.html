@@ -808,6 +808,10 @@
                                 <label title="TP/SP mode always runs tensor parallel and sequence parallel together."><input type="checkbox" id="cfg-sequence-parallel" checked disabled> Sequence Parallel (SP)</label>
                                 <small>Always enabled for this mode. Spatial tokens are split across GPUs alongside weight sharding.</small>
                             </div>
+                            <div style="margin-top: 12px;">
+                                <label><input type="checkbox" id="cfg-no-fuse-qkv"> Disable Fused QKV</label>
+                                <small>Debug option. Leaves attention q/k/v projections unfused instead of using the packed QKV/KV TP path.</small>
+                            </div>
                             <div style="margin-top: 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); font-size: 0.8rem; line-height: 1.5;">
                                 <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Sample generation during training is disabled. Backend is selected above. Torch Compile is incompatible.
                             </div>

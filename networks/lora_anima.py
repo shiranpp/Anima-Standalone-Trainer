@@ -133,6 +133,71 @@ class ColumnParallelLoRAModule(LoRAModule):
         return output
 
 
+class PackedColumnParallelLoRAModule(LoRAModule):
+    """LoRA adapter for packed ColumnParallelLinear (qkv_proj / kv_proj)."""
+
+    def __init__(self, *args, tp_group=None, seq_dim=1, use_sp=False, logical_part_names=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.org_module_ref = [self.org_module]
+        self._tp_group = tp_group
+        self._seq_dim = seq_dim
+        self._use_sp = use_sp
+        self._packed_parts = int(getattr(self.org_module, "packed_parts", 0) or 0)
+        if self._packed_parts < 2:
+            raise ValueError("PackedColumnParallelLoRAModule requires org_module.packed_parts >= 2")
+
+        local_part = int(getattr(self.org_module, "local_part_size", self.org_module.out_features // self._packed_parts))
+        in_dim = self.org_module.in_features
+        if logical_part_names is None:
+            if self.lora_name.endswith("_qkv_proj"):
+                logical_part_names = ["q_proj", "k_proj", "v_proj"]
+            elif self.lora_name.endswith("_kv_proj"):
+                logical_part_names = ["k_proj", "v_proj"]
+            else:
+                logical_part_names = [f"part{i}" for i in range(self._packed_parts)]
+        self.logical_part_names = list(logical_part_names)
+
+        self.lora_down = torch.nn.ModuleList(
+            [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(self._packed_parts)]
+        )
+        self.lora_up = torch.nn.ModuleList(
+            [torch.nn.Linear(self.lora_dim, local_part, bias=False) for _ in range(self._packed_parts)]
+        )
+        for down in self.lora_down:
+            torch.nn.init.kaiming_uniform_(down.weight, a=math.sqrt(5))
+        for up in self.lora_up:
+            torch.nn.init.zeros_(up.weight)
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return org_forwarded
+
+        lora_x = x
+        if self._use_sp and self._tp_group is not None:
+            from wd_parallel import gather_from_sp_region
+            lora_x = gather_from_sp_region(x, self._tp_group, self._seq_dim)
+
+        outs = []
+        for down, up in zip(self.lora_down, self.lora_up):
+            lx = down(lora_x)
+            if self.dropout is not None and self.training:
+                lx = torch.nn.functional.dropout(lx, p=self.dropout)
+            if self.rank_dropout is not None and self.training:
+                mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
+                if len(lx.size()) == 3:
+                    mask = mask.unsqueeze(1)
+                lx = lx * mask
+                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
+            else:
+                scale = self.scale
+            outs.append(up(lx) * scale)
+
+        return org_forwarded + torch.cat(outs, dim=-1) * self.multiplier
+
+
 class RowParallelLoRAModule(LoRAModule):
     """LoRA adapter for RowParallelLinear.
 
@@ -232,6 +297,14 @@ def _select_lora_class(child_module, tp_group=None, use_sp=False, seq_dim=1):
     """
     cls_name = child_module.__class__.__name__
     if cls_name == "ColumnParallelLinear":
+        packed_parts = int(getattr(child_module, "packed_parts", 0) or 0)
+        if packed_parts:
+            return PackedColumnParallelLoRAModule, dict(
+                tp_group=tp_group,
+                seq_dim=seq_dim,
+                use_sp=getattr(child_module, 'sequence_parallel', use_sp),
+                logical_part_names=None,
+            )
         return ColumnParallelLoRAModule, dict(tp_group=tp_group, seq_dim=seq_dim,
                                                use_sp=getattr(child_module, 'sequence_parallel', use_sp))
     elif cls_name == "RowParallelLinear":
@@ -384,6 +457,20 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
 
         if "llm_adapter" in lora_name:
             train_llm_adapter = True
+
+    # TP/SP fused-QKV training exposes qkv_proj/kv_proj internally, but saved
+    # LoRAs keep standard q_proj/k_proj/v_proj names.  Mirror those dimensions
+    # onto the packed internal names so dim-from-weights works after fusion.
+    for lora_name, dim in list(modules_dim.items()):
+        packed_name = None
+        if lora_name.endswith("_self_attn_q_proj") or lora_name.endswith("_self_attn_k_proj") or lora_name.endswith("_self_attn_v_proj"):
+            packed_name = lora_name.rsplit("_", 2)[0] + "_qkv_proj"
+        elif lora_name.endswith("_cross_attn_k_proj") or lora_name.endswith("_cross_attn_v_proj"):
+            packed_name = lora_name.rsplit("_", 2)[0] + "_kv_proj"
+        if packed_name is not None:
+            modules_dim.setdefault(packed_name, dim)
+            if lora_name in modules_alpha:
+                modules_alpha.setdefault(packed_name, modules_alpha[lora_name])
 
     module_class = LoRAInfModule if for_inference else LoRAModule
 
@@ -631,6 +718,61 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
 
+    @staticmethod
+    def _packed_lora_standard_name(lora_name: str, logical_name: str) -> str:
+        if lora_name.endswith("_qkv_proj"):
+            return lora_name[: -len("_qkv_proj")] + f"_{logical_name}"
+        if lora_name.endswith("_kv_proj"):
+            return lora_name[: -len("_kv_proj")] + f"_{logical_name}"
+        return f"{lora_name}_{logical_name}"
+
+    def _state_dict_to_standard_packed_lora_keys(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        converted = dict(state_dict)
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if not isinstance(lora, PackedColumnParallelLoRAModule):
+                continue
+            prefix = lora.lora_name
+            alpha_key = f"{prefix}.alpha"
+            alpha = converted.get(alpha_key, lora.alpha.detach())
+            for idx, logical_name in enumerate(lora.logical_part_names):
+                std_prefix = self._packed_lora_standard_name(prefix, logical_name)
+                down_key = f"{prefix}.lora_down.{idx}.weight"
+                up_key = f"{prefix}.lora_up.{idx}.weight"
+                if down_key in converted:
+                    converted[f"{std_prefix}.lora_down.weight"] = converted[down_key]
+                if up_key in converted:
+                    converted[f"{std_prefix}.lora_up.weight"] = converted[up_key]
+                converted[f"{std_prefix}.alpha"] = alpha
+            for key in list(converted.keys()):
+                if key == alpha_key or key.startswith(f"{prefix}.lora_down.") or key.startswith(f"{prefix}.lora_up."):
+                    del converted[key]
+        return converted
+
+    def _state_dict_from_standard_packed_lora_keys(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        converted = dict(state_dict)
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if not isinstance(lora, PackedColumnParallelLoRAModule):
+                continue
+            prefix = lora.lora_name
+            found_alpha = None
+            for idx, logical_name in enumerate(lora.logical_part_names):
+                std_prefix = self._packed_lora_standard_name(prefix, logical_name)
+                std_down = f"{std_prefix}.lora_down.weight"
+                std_up = f"{std_prefix}.lora_up.weight"
+                std_alpha = f"{std_prefix}.alpha"
+                if std_down in converted:
+                    converted[f"{prefix}.lora_down.{idx}.weight"] = converted[std_down]
+                    del converted[std_down]
+                if std_up in converted:
+                    converted[f"{prefix}.lora_up.{idx}.weight"] = converted[std_up]
+                    del converted[std_up]
+                if std_alpha in converted:
+                    found_alpha = converted[std_alpha]
+                    del converted[std_alpha]
+            if found_alpha is not None:
+                converted[f"{prefix}.alpha"] = found_alpha
+        return converted
+
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
@@ -638,6 +780,7 @@ class LoRANetwork(torch.nn.Module):
         else:
             weights_sd = torch.load(file, map_location="cpu")
 
+        weights_sd = self._state_dict_from_standard_packed_lora_keys(weights_sd)
         info = self.load_state_dict(weights_sd, False)
         return info
 
@@ -811,7 +954,21 @@ class LoRANetwork(torch.nn.Module):
         import torch.distributed as dist
 
         for lora in self.text_encoder_loras + self.unet_loras:
-            if isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
+            if isinstance(lora, PackedColumnParallelLoRAModule) and lora._tp_group is not None:
+                org_module = lora.org_module_ref[0]
+                original_part = int(getattr(org_module, "original_part_size", 0) or 0)
+                for up in lora.lora_up:
+                    w = up.weight.data
+                    orig_device = w.device
+                    w_c = w.contiguous().cuda()
+                    gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
+                    dist.all_gather(gathered, w_c, group=lora._tp_group)
+                    full = torch.cat(gathered, dim=0).to(orig_device)
+                    if trim_padding and original_part:
+                        full = self._trim_tensor_dim(full, 0, original_part)
+                    up.weight.data = full
+
+            elif isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
                 # lora_up.weight: (out_features/tp, lora_dim) → gather dim 0
                 w = lora.lora_up.weight.data
                 orig_device = w.device
@@ -848,7 +1005,19 @@ class LoRANetwork(torch.nn.Module):
         import torch.distributed as dist
 
         for lora in self.text_encoder_loras + self.unet_loras:
-            if isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
+            if isinstance(lora, PackedColumnParallelLoRAModule) and lora._tp_group is not None:
+                tp = lora._tp_group.size()
+                rank = dist.get_rank(group=lora._tp_group)
+                org_module = lora.org_module_ref[0]
+                padded_part = int(getattr(org_module, "padded_part_size", 0) or 0)
+                for up in lora.lora_up:
+                    w = up.weight.data
+                    if padded_part:
+                        w = self._pad_tensor_dim(w, 0, padded_part)
+                    chunk = w.shape[0] // tp
+                    up.weight.data = w[rank * chunk:(rank + 1) * chunk].contiguous()
+
+            elif isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
                 tp = lora._tp_group.size()
                 rank = dist.get_rank(group=lora._tp_group)
                 w = lora.lora_up.weight.data          # (D_out, lora_dim) after gather
@@ -872,7 +1041,7 @@ class LoRANetwork(torch.nn.Module):
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
-        state_dict = self.state_dict()
+        state_dict = self._state_dict_to_standard_packed_lora_keys(self.state_dict())
 
         if dtype is not None:
             for key in list(state_dict.keys()):

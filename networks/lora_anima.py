@@ -71,6 +71,9 @@ class ColumnParallelLoRAModule(LoRAModule):
         if self._use_sp:
             from wd_parallel import gather_from_sp_region
             return gather_from_sp_region(x, self._tp_group, self._seq_dim)
+        if getattr(self.org_module_ref[0], "skip_input_grad", False):
+            from wd_parallel import copy_to_tp_region_no_input_grad
+            return copy_to_tp_region_no_input_grad(x, self._tp_group)
         from wd_parallel import copy_to_tp_region
         return copy_to_tp_region(x, self._tp_group)
 
@@ -179,6 +182,9 @@ class PackedColumnParallelLoRAModule(LoRAModule):
         if self._use_sp:
             from wd_parallel import gather_from_sp_region
             return gather_from_sp_region(x, self._tp_group, self._seq_dim)
+        if getattr(self.org_module_ref[0], "skip_input_grad", False):
+            from wd_parallel import copy_to_tp_region_no_input_grad
+            return copy_to_tp_region_no_input_grad(x, self._tp_group)
         from wd_parallel import copy_to_tp_region
         return copy_to_tp_region(x, self._tp_group)
 

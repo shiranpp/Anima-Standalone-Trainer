@@ -378,6 +378,36 @@ def _fixup_attention_heads_for_tp(model: torch.nn.Module) -> int:
     return updated
 
 
+def _mark_replicated_context_layers_no_input_grad(
+    model: torch.nn.Module,
+    *,
+    text_encoder_frozen: bool,
+) -> int:
+    """Mark replicated-input TP column layers whose input grad can be skipped.
+
+    Safe only when the text encoder / conditioning source is frozen. Targets
+    cross-attention K/V projections that consume replicated context.
+    """
+    if not text_encoder_frozen:
+        return 0
+
+    marked = 0
+    suffixes = (
+        ".cross_attn.kv_proj",
+        ".cross_attn.k_proj",
+        ".cross_attn.v_proj",
+    )
+    for name, module in model.named_modules():
+        if not any(name.endswith(suffix) for suffix in suffixes):
+            continue
+        if getattr(module, "sequence_parallel", True):
+            continue
+        if hasattr(module, "skip_input_grad"):
+            module.skip_input_grad = True
+            marked += 1
+    return marked
+
+
 def _tag_tp_lora_params(network: torch.nn.Module) -> tuple[int, int]:
     """Tag TP-sharded and SP-partial LoRA params for wd_parallel grad sync.
 
@@ -512,6 +542,10 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             # Attention modules still use the original n_heads after sharding.
             # Set each module to the padded local head count for this rank.
             n_attn_fixed = _fixup_attention_heads_for_tp(dit)
+            n_no_input_grad = _mark_replicated_context_layers_no_input_grad(
+                dit,
+                text_encoder_frozen=not self.is_train_text_encoder(args),
+            )
 
             # SP scatter/gather: set the process group so MiniTrainDIT.forward
             # scatters x along H before the block loop and gathers back after.
@@ -523,6 +557,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                 f"llm_adapter={getattr(dit, 'use_llm_adapter', False)}, "
                 f"fuse_qkv={fuse_qkv}, fused_attention_modules={fused_count}, "
                 f"attention_modules_patched={n_attn_fixed}, "
+                f"replicated_context_no_input_grad={n_no_input_grad}, "
                 f"model_width={tp_geometry['model_channels']}->{tp_geometry['padded_width']}, "
                 f"local_width={tp_geometry['local_width']}, local_heads={tp_geometry['local_heads']}, "
                 f"head_dim={tp_geometry['head_dim']}, padding_added={tp_geometry['padding_added']}"
@@ -532,6 +567,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                 f"startup backend={dist.get_backend()} tp_degree={self.tp_groups.tp_size} sp={self.use_sp} "
                 f"llm_adapter={getattr(dit, 'use_llm_adapter', False)} fuse_qkv={fuse_qkv} "
                 f"fused_attention_modules={fused_count} attention_modules_patched={n_attn_fixed} "
+                f"replicated_context_no_input_grad={n_no_input_grad} "
                 f"model_width={tp_geometry['model_channels']} padded_width={tp_geometry['padded_width']} "
                 f"local_width={tp_geometry['local_width']} local_heads={tp_geometry['local_heads']} "
                 f"head_dim={tp_geometry['head_dim']} padding_added={tp_geometry['padding_added']} "

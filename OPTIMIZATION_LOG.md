@@ -33,6 +33,14 @@ When we add more, append a new entry here and keep the commit hash up to date.
   - Replaced the three separate packed `lora_up` matmuls with one fused batched up projection.
   - Verified the fused packed path matches the old per-part math on CPU.
 
+### 4. Replicated-context no-input-grad fast path
+- Commit: `trainer repo commit; requires local companion changes in wd_parallel`
+- What changed:
+  - Added a detached replicated-input TP path for column-parallel layers that consume frozen context.
+  - Marks only cross-attention K/V replicated-input TP layers, and only when the text encoder is frozen.
+  - Updates TP-aware LoRA wrappers to honor the same skip-input-grad flag so the base path and LoRA path stay consistent.
+  - Intended to remove the backward `all_reduce` on replicated frozen conditioning branches when gradient checkpointing would otherwise force those tensors to require grad.
+
 ## Notes
 - The current implementation is still compatible with existing save/load behavior.
 - The log should be updated whenever we add another TP/SP, LoRA, or trainer-side optimization.

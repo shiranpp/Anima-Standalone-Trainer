@@ -19,14 +19,18 @@ function execWindowsPowerShellSync(script, options = {}) {
 // Auto-install cuda_direct_backend Windows only
 (function ensureCudaDirectBackend() {
     if (process.platform !== 'win32') return;
+    const ROOT_DIR_BOOTSTRAP = path.join(__dirname, '..');
+    const venvPath = path.join(ROOT_DIR_BOOTSTRAP, 'venv');
+    const pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
+    const pythonCmd = fs.existsSync(pythonPath) ? `"${pythonPath}"` : 'python';
     try {
-        execWindowsPowerShellSync('python -c "import cuda_direct_backend"', { stdio: 'ignore' });
+        execWindowsPowerShellSync(`${pythonCmd} -c "import cuda_direct_backend"`, { stdio: 'ignore' });
     } catch {
         const pkgPath = path.join(__dirname, '..', 'cuda_direct_pkg');
         if (fs.existsSync(pkgPath)) {
             console.log('[setup] Installing cuda_direct_backend...');
             try {
-                execWindowsPowerShellSync(`python -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
+                execWindowsPowerShellSync(`${pythonCmd} -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
                 console.log('[setup] cuda_direct_backend installed.\n');
             } catch {
                 console.warn('[setup] Could not install cuda_direct_backend. Multi-GPU cuda_direct will be unavailable.\n');
@@ -995,7 +999,10 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                     return { error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.` };
                 const n = validIds.length;
                 const target = path.join(ROOT_DIR, tpScript);
-                const tpBackend = ta.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
+                // Validate tp_backend against whitelist
+                const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
+                const rawBackend = ta.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
+                const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'cuda_direct' : 'nccl');
                 tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n} --tp_backend ${tpBackend} --sequence_parallel --config_file="${mergedConfigPath}"`;
 
             } else if (mode === 'fsdp2') {
@@ -1461,8 +1468,14 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
         if (launchMode === 'tp_sp' && mergedConfig.training_arguments) {
             mergedConfig.training_arguments.sequence_parallel = true;
-            mergedConfig.training_arguments.tp_degree = Math.max(2, Number(mergedConfig.training_arguments.tp_degree || 2));
-            mergedConfig.training_arguments.tp_backend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
+            // Normalize tp_degree with NaN guard
+            let tp = Number(mergedConfig.training_arguments.tp_degree || 2);
+            if (!Number.isFinite(tp)) tp = 2;
+            mergedConfig.training_arguments.tp_degree = Math.max(2, tp);
+            // Validate tp_backend against whitelist
+            const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
+            const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
+            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'cuda_direct' : 'nccl');
             delete mergedConfig.training_arguments.use_cuda_direct;
             delete mergedConfig.training_arguments.save_state;
             delete mergedConfig.training_arguments.save_state_on_train_end;

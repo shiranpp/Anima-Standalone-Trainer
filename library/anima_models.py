@@ -1429,9 +1429,15 @@ class MiniTrainDIT(nn.Module):
                 if block_kwargs["rope_emb_L_1_1_D"] is not None:
                     T_val = x_B_T_H_W_D.shape[1]
                     W_val = x_B_T_H_W_D.shape[3]
-                    rope_extra = T_val * _sp_h_pad * W_val
-                    block_kwargs["rope_emb_L_1_1_D"] = torch.nn.functional.pad(
-                        block_kwargs["rope_emb_L_1_1_D"], (0, 0, 0, 0, 0, 0, 0, rope_extra))
+                    # Reshape flattened RoPE to (T, H, W, 1, 1, D), pad H, then flatten back
+                    rope_flat = block_kwargs["rope_emb_L_1_1_D"]
+                    D_val = rope_flat.shape[-1]
+                    H_orig_val = rope_flat.shape[0] // (T_val * W_val)
+                    rope_reshaped = rope_flat.view(T_val, H_orig_val, W_val, 1, 1, D_val)
+                    rope_padded = torch.nn.functional.pad(
+                        rope_reshaped, (0, 0, 0, 0, 0, 0, 0, _sp_h_pad))
+                    block_kwargs["rope_emb_L_1_1_D"] = rope_padded.view(
+                        T_val * (H_orig_val + _sp_h_pad) * W_val, 1, 1, D_val)
             x_B_T_H_W_D = _split_along_dim(x_B_T_H_W_D, _sp_group, seq_dim=2)
             if block_kwargs["extra_per_block_pos_emb"] is not None:
                 block_kwargs["extra_per_block_pos_emb"] = _split_along_dim(

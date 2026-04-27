@@ -39,6 +39,44 @@ function execWindowsPowerShellSync(script, options = {}) {
     }
 })();
 
+// Auto-install wd_parallel (all platforms)
+(function ensureWdParallel() {
+    const ROOT_DIR_BOOTSTRAP = path.join(__dirname, '..');
+    const venvPath = path.join(ROOT_DIR_BOOTSTRAP, 'venv');
+    let pythonCmd;
+    if (process.platform === 'win32') {
+        const pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
+        pythonCmd = fs.existsSync(pythonPath) ? `"${pythonPath}"` : 'python';
+    } else {
+        const pythonPath = path.join(venvPath, 'bin', 'python');
+        pythonCmd = fs.existsSync(pythonPath) ? pythonPath : 'python3';
+    }
+
+    const pkgPath = path.join(__dirname, '..', 'wd_parallel_pkg');
+    if (!fs.existsSync(pkgPath)) return;
+
+    try {
+        if (process.platform === 'win32') {
+            execWindowsPowerShellSync(`${pythonCmd} -c "import wd_parallel"`, { stdio: 'ignore' });
+        } else {
+            execSync(`${pythonCmd} -c "import wd_parallel"`, { stdio: 'ignore' });
+        }
+    } catch {
+        console.log('[setup] Installing wd_parallel...');
+        try {
+            if (process.platform === 'win32') {
+                execWindowsPowerShellSync(`${pythonCmd} -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
+            } else {
+                execSync(`${pythonCmd} -m pip install --no-deps -e '${pkgPath}'`, { stdio: 'pipe' });
+            }
+            console.log('[setup] wd_parallel installed.\n');
+        } catch (err) {
+            console.warn('[setup] Could not install wd_parallel. TP/SP training may be unavailable.');
+            console.warn(`[setup] To fix manually, run: pip install -e "${pkgPath}"\n`);
+        }
+    }
+})();
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });

@@ -47,7 +47,10 @@ function pipInstall(pythonCmd, pkgPath) {
 function ensurePackage(pkgPath, moduleName, { label, unavailableMsg, fixHint }) {
     if (!fs.existsSync(pkgPath)) return;
     const pythonCmd = getPythonCmd();
-    if (canImport(pythonCmd, moduleName)) return;
+    if (canImport(pythonCmd, moduleName)) {
+        console.log(`[setup] ${label} verified.`);
+        return;
+    }
     console.log(`[setup] Installing ${label}...`);
     try {
         pipInstall(pythonCmd, pkgPath);

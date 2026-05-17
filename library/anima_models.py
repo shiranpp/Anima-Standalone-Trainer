@@ -788,6 +788,28 @@ class PatchEmbed(nn.Module):
         return x
 
 
+def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+    """Run an AdaLN modulation Sequential (SiLU + Linear[+Linear]) entirely in fp32.
+
+    Used in place of torch.autocast(device_type=..., dtype=torch.float32, enabled=True):
+    fp32 is not a documented autocast target on CUDA (autocast supports fp16/bf16) and
+    is not guaranteed to actually promote fp16 weights/inputs across PyTorch versions.
+    This casts the activation and each Linear's weight/bias to fp32 before the matmul.
+    The caller should wrap this in torch.amp.autocast(enabled=False) so an outer fp16
+    autocast does not re-downcast our fp32 work.
+    """
+    out = x.float()
+    for module in modulation:
+        if isinstance(module, nn.Linear):
+            weight = module.weight.float()
+            bias = module.bias.float() if module.bias is not None else None
+            out = F.linear(out, weight, bias)
+        else:
+            # SiLU and other dtype-passthrough activations
+            out = module(out)
+    return out
+
+
 # Final Layer
 class FinalLayer(nn.Module):
     """Final layer with AdaLN modulation + unpatchify."""
@@ -841,8 +863,28 @@ class FinalLayer(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ):
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # AdaLN modulation in fp32 to avoid Linear-layer overflow under fp16. Only safe
+        # when an outer autocast context is active: it will downcast the fp32 shift/scale
+        # back to fp16 inside self.linear below. The sampling loop (anima_train_utils
+        # .do_sample) explicitly disables autocast and runs with fp16 weights, so we
+        # must keep the original fp16 path there to avoid Float vs Half matmul errors.
+        do_fp32 = use_fp32 and torch.is_autocast_enabled(x_B_T_H_W_D.device.type)
+        if do_fp32:
+            # torch.autocast(dtype=float32) is not a documented autocast target and may
+            # silently no-op; cast inputs and Linear weights to fp32 explicitly under
+            # autocast(enabled=False) so an outer fp16 autocast does not re-downcast.
+            with torch.amp.autocast(device_type=x_B_T_H_W_D.device.type, enabled=False):
+                if self.use_adaln_lora:
+                    assert adaln_lora_B_T_3D is not None
+                    shift_B_T_D, scale_B_T_D = (
+                        _run_adaln_modulation_fp32(self.adaln_modulation, emb_B_T_D)
+                        + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size].float()
+                    ).chunk(2, dim=-1)
+                else:
+                    shift_B_T_D, scale_B_T_D = _run_adaln_modulation_fp32(
+                        self.adaln_modulation, emb_B_T_D
+                    ).chunk(2, dim=-1)
+        else:
             if self.use_adaln_lora:
                 assert adaln_lora_B_T_3D is not None
                 shift_B_T_D, scale_B_T_D = (
@@ -964,15 +1006,50 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ) -> torch.Tensor:
-        if use_fp32:
-            # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
+        # Gate the fp32 stability path on the outer autocast: only safe when an outer
+        # autocast(fp16) context will downcast fp32 activations back to fp16 before the
+        # fp16-weighted Linear layers in self_attn/cross_attn/mlp. The sampling loop
+        # in anima_train_utils.do_sample disables autocast and runs the dit with fp16
+        # weights, so we must keep the original fp16 path there to avoid Float vs Half
+        # matmul errors.
+        do_fp32 = use_fp32 and torch.is_autocast_enabled(x_B_T_H_W_D.device.type)
+
+        if do_fp32:
+            # Cast to float32 for better numerical stability in residual connections;
+            # the enclosing autocast will downcast back to fp16 inside each sublayer.
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # AdaLN modulation in fp32 to avoid Linear-layer overflow under fp16.
+        # torch.autocast(dtype=float32) is not a documented autocast target and may
+        # silently no-op; cast inputs and Linear weights to fp32 explicitly under
+        # autocast(enabled=False) so an outer fp16 autocast does not re-downcast.
+        if do_fp32:
+            with torch.amp.autocast(device_type=x_B_T_H_W_D.device.type, enabled=False):
+                if self.use_adaln_lora:
+                    adaln_lora_fp32 = adaln_lora_B_T_3D.float()
+                    shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
+                        _run_adaln_modulation_fp32(self.adaln_modulation_self_attn, emb_B_T_D) + adaln_lora_fp32
+                    ).chunk(3, dim=-1)
+                    shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
+                        _run_adaln_modulation_fp32(self.adaln_modulation_cross_attn, emb_B_T_D) + adaln_lora_fp32
+                    ).chunk(3, dim=-1)
+                    shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                        _run_adaln_modulation_fp32(self.adaln_modulation_mlp, emb_B_T_D) + adaln_lora_fp32
+                    ).chunk(3, dim=-1)
+                else:
+                    shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = _run_adaln_modulation_fp32(
+                        self.adaln_modulation_self_attn, emb_B_T_D
+                    ).chunk(3, dim=-1)
+                    shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = _run_adaln_modulation_fp32(
+                        self.adaln_modulation_cross_attn, emb_B_T_D
+                    ).chunk(3, dim=-1)
+                    shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = _run_adaln_modulation_fp32(
+                        self.adaln_modulation_mlp, emb_B_T_D
+                    ).chunk(3, dim=-1)
+        else:
             if self.use_adaln_lora:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                     self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D

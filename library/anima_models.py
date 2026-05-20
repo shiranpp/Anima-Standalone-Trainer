@@ -789,25 +789,33 @@ class PatchEmbed(nn.Module):
 
 
 def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-    """Run an AdaLN modulation Sequential (SiLU + Linear[+Linear]) entirely in fp32.
+    """Run an AdaLN modulation Sequential and return the result in fp32.
 
-    Used in place of torch.autocast(device_type=..., dtype=torch.float32, enabled=True):
-    fp32 is not a documented autocast target on CUDA (autocast supports fp16/bf16) and
-    is not guaranteed to actually promote fp16 weights/inputs across PyTorch versions.
-    This casts the activation and each Linear's weight/bias to fp32 before the matmul.
-    The caller should wrap this in torch.amp.autocast(enabled=False) so an outer fp16
-    autocast does not re-downcast our fp32 work.
+    Calls each submodule through its (possibly LoRA-patched) forward, so any
+    runtime monkey-patches on nn.Linear.forward -- e.g. those installed by
+    networks/lora.py: ``self.org_module.forward = self.forward`` -- are preserved.
+    Bypassing forward with F.linear(out, module.weight.float(), ...) would
+    silently drop LoRA deltas on adaln_modulation Linears during fp16 training,
+    so we deliberately do not do that.
+
+    As a trade-off, the inner matmul still runs in the module's weight dtype
+    (typically fp16). The fp32 cast on the output buys precision for the
+    downstream + adaln_lora addition and the layer-norm scaling, matching the
+    spirit of upstream's torch.autocast(dtype=float32) attempt; it does NOT
+    prevent overflow inside the matmul itself. The caller should wrap this in
+    torch.amp.autocast(enabled=False) so an outer fp16 autocast does not
+    re-downcast the fp32 result.
     """
-    out = x.float()
+    out = x
     for module in modulation:
         if isinstance(module, nn.Linear):
-            weight = module.weight.float()
-            bias = module.bias.float() if module.bias is not None else None
-            out = F.linear(out, weight, bias)
+            # Under autocast(enabled=False), F.linear requires input dtype to
+            # match the weight dtype; the LoRA-patched forward calls F.linear
+            # internally, so we honor the same constraint here.
+            out = module(out.to(module.weight.dtype))
         else:
-            # SiLU and other dtype-passthrough activations
             out = module(out)
-    return out
+    return out.float()
 
 
 def _modulate_adaln(
